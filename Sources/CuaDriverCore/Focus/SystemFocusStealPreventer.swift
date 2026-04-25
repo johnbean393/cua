@@ -177,24 +177,44 @@ private final class Dispatcher: @unchecked Sendable {
         lock.unlock()
 
         if shouldRemoveObserver, let token {
-            NSWorkspace.shared.notificationCenter.removeObserver(token)
+            if Thread.isMainThread {
+                NSWorkspace.shared.notificationCenter.removeObserver(token)
+            } else {
+                DispatchQueue.main.async {
+                    NSWorkspace.shared.notificationCenter.removeObserver(token)
+                }
+            }
         }
         return pending
     }
 
     private func installObserver() {
+        // Must register on the main thread — NSWorkspaceNotificationCenter's
+        // lazy LaunchServices subsystem init calls os_log with the current
+        // thread's CFRunLoop, which crashes on Swift cooperative executor
+        // threads (they have no CFRunLoop).
+        //
         // queue: nil delivers the callback synchronously on the posting
         // thread. NSWorkspace posts on main, so the activation handler
         // runs on main with no extra hop — which matters because we want
         // the reactivation Task scheduled as close to the thief's
-        // activation moment as possible, even if the actual
-        // `activate(options:)` call is then deferred by the delay.
-        let token = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didActivateApplicationNotification,
-            object: nil,
-            queue: nil
-        ) { [weak self] note in
+        // activation moment as possible.
+        let block: (Notification) -> Void = { [weak self] note in
             self?.handleActivation(note: note)
+        }
+        let register = {
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didActivateApplicationNotification,
+                object: nil,
+                queue: nil,
+                using: block
+            )
+        }
+        let token: NSObjectProtocol
+        if Thread.isMainThread {
+            token = register()
+        } else {
+            token = DispatchQueue.main.sync { register() }
         }
 
         lock.lock()
@@ -206,7 +226,13 @@ private final class Dispatcher: @unchecked Sendable {
             lock.unlock()
         } else {
             lock.unlock()
-            NSWorkspace.shared.notificationCenter.removeObserver(token)
+            if Thread.isMainThread {
+                NSWorkspace.shared.notificationCenter.removeObserver(token)
+            } else {
+                DispatchQueue.main.async {
+                    NSWorkspace.shared.notificationCenter.removeObserver(token)
+                }
+            }
         }
     }
 
